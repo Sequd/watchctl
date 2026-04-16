@@ -1,0 +1,277 @@
+package ui
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/ekorunov/watchctl/internal/model"
+)
+
+// Tab represents the active screen.
+type Tab int
+
+const (
+	TabLive Tab = iota
+	TabHistory
+	TabDetails
+)
+
+const cpuHistoryLen = 60
+
+var tabNames = []string{"Live", "History", "Details"}
+
+// Model is the top-level Bubble Tea model.
+type Model struct {
+	// Data
+	snapshot     model.CPUSnapshot
+	peakEvents   []model.PeakEvent
+	summary      model.HistorySummary
+	lastPeakTime time.Time
+	peakCount    int
+	cpuHistory   []float64
+	procPeaks    map[int32]float64 // PID → max CPU% seen
+
+	// Threshold
+	threshold float64
+	threshCh  chan<- float64
+
+	// UI state
+	activeTab    Tab
+	cursor       int
+	detailIdx    int
+	width        int
+	height       int
+	statusMsg    string
+	statusExpiry time.Time
+
+	// Channels (read in Cmds)
+	snapCh <-chan model.CPUSnapshot
+	peakCh <-chan model.PeakEvent
+}
+
+// NewModel creates the initial UI model.
+func NewModel(snapCh <-chan model.CPUSnapshot, peakCh <-chan model.PeakEvent, threshold float64, threshCh chan<- float64) Model {
+	return Model{
+		snapCh:    snapCh,
+		peakCh:    peakCh,
+		threshold: threshold,
+		threshCh:  threshCh,
+		procPeaks: make(map[int32]float64),
+		width:     120,
+		height:    30,
+	}
+}
+
+// Init starts the background listeners.
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		listenSnapshot(m.snapCh),
+		listenPeak(m.peakCh),
+		tickCmd(),
+	)
+}
+
+// Update handles messages.
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+
+	case SnapshotMsg:
+		m.snapshot = msg.Snapshot
+		m.pushCPU(msg.Snapshot.TotalUsage)
+		m.updatePeaks(msg.Snapshot.Processes)
+		return m, listenSnapshot(m.snapCh)
+
+	case PeakMsg:
+		m.peakEvents = append(m.peakEvents, msg.Event)
+		m.lastPeakTime = msg.Event.Timestamp
+		m.peakCount++
+		m.setStatus("Peak detected: %.1f%% CPU", msg.Event.TotalCPU)
+		return m, listenPeak(m.peakCh)
+
+	case HistoryLoadedMsg:
+		m.peakEvents = msg.Events
+		m.summary = msg.Summary
+		if len(msg.Events) > 0 {
+			m.setStatus("Loaded %d historical events", len(msg.Events))
+		}
+		return m, nil
+
+	case tickMsg:
+		return m, tickCmd()
+	}
+
+	return m, nil
+}
+
+func (m *Model) pushCPU(pct float64) {
+	m.cpuHistory = append(m.cpuHistory, pct)
+	if len(m.cpuHistory) > cpuHistoryLen {
+		m.cpuHistory = m.cpuHistory[len(m.cpuHistory)-cpuHistoryLen:]
+	}
+}
+
+func (m *Model) updatePeaks(procs []model.ProcessInfo) {
+	for _, p := range procs {
+		if p.CPUPercent > m.procPeaks[p.PID] {
+			m.procPeaks[p.PID] = p.CPUPercent
+		}
+	}
+}
+
+func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, keys.Quit):
+		if m.activeTab == TabDetails {
+			m.activeTab = TabHistory
+			return m, nil
+		}
+		return m, tea.Quit
+
+	case key.Matches(msg, keys.Tab):
+		switch m.activeTab {
+		case TabLive:
+			m.activeTab = TabHistory
+		case TabHistory:
+			m.activeTab = TabLive
+		case TabDetails:
+			m.activeTab = TabLive
+		}
+		m.cursor = 0
+		return m, nil
+
+	case key.Matches(msg, keys.Up):
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.Down):
+		m.cursor++
+		m.clampCursor()
+		return m, nil
+
+	case key.Matches(msg, keys.Enter):
+		if m.activeTab == TabHistory && len(m.peakEvents) > 0 {
+			m.detailIdx = m.cursor
+			m.activeTab = TabDetails
+			m.cursor = 0
+			return m, nil
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.Back):
+		if m.activeTab == TabDetails {
+			m.activeTab = TabHistory
+			m.cursor = m.detailIdx
+			return m, nil
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.Reset):
+		if m.activeTab == TabLive {
+			m.snapshot = model.CPUSnapshot{}
+			m.cpuHistory = nil
+			m.procPeaks = make(map[int32]float64)
+			m.lastPeakTime = time.Time{}
+			m.peakCount = 0
+			m.summary = model.HistorySummary{}
+			m.cursor = 0
+			m.setStatus("Statistics reset")
+			return m, nil
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.ThreshUp):
+		if m.activeTab == TabLive && m.threshold < 95 {
+			m.threshold += 5
+			select {
+			case m.threshCh <- m.threshold:
+			default:
+			}
+			m.setStatus("Threshold: %.0f%%", m.threshold)
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.ThreshDn):
+		if m.activeTab == TabLive && m.threshold > 10 {
+			m.threshold -= 5
+			select {
+			case m.threshCh <- m.threshold:
+			default:
+			}
+			m.setStatus("Threshold: %.0f%%", m.threshold)
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m *Model) clampCursor() {
+	max := 0
+	switch m.activeTab {
+	case TabLive:
+		max = len(m.snapshot.Processes) - 1
+	case TabHistory:
+		max = len(m.peakEvents) - 1
+	case TabDetails:
+		if m.detailIdx < len(m.peakEvents) {
+			max = len(m.peakEvents[m.detailIdx].TopProcs) - 1
+		}
+	}
+	if max < 0 {
+		max = 0
+	}
+	if m.cursor > max {
+		m.cursor = max
+	}
+}
+
+func (m *Model) setStatus(format string, args ...interface{}) {
+	m.statusMsg = fmt.Sprintf(format, args...)
+	m.statusExpiry = time.Now().Add(3 * time.Second)
+}
+
+// View renders the full screen.
+func (m Model) View() string {
+	return m.renderView()
+}
+
+// --- tea.Cmd helpers ---
+
+func listenSnapshot(ch <-chan model.CPUSnapshot) tea.Cmd {
+	return func() tea.Msg {
+		snap, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return SnapshotMsg{Snapshot: snap}
+	}
+}
+
+func listenPeak(ch <-chan model.PeakEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return PeakMsg{Event: ev}
+	}
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return tickMsg{}
+	})
+}
