@@ -89,7 +89,7 @@ func main() {
 	summary := history.Analyze(pastEvents, currentNames)
 
 	// TUI.
-	m := ui.NewModel(uiSnapCh, uiPeakCh, cfg.Threshold, threshCh)
+	m := ui.NewModel(uiSnapCh, uiPeakCh, cfg.Threshold, threshCh, log.Dir())
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 

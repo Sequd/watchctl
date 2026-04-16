@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ func (m Model) renderView() string {
 		body = m.renderLive()
 	case TabHistory:
 		body = m.renderHistory()
+	case TabAnalysis:
+		body = m.renderAnalysis()
 	case TabDetails:
 		body = m.renderDetails()
 	}
@@ -53,10 +56,11 @@ func (m Model) renderHeader() string {
 func (m Model) renderTabs() string {
 	var tabs []string
 	for i, name := range tabNames {
-		if Tab(i) == TabDetails && m.activeTab != TabDetails {
+		tab := Tab(i)
+		if tab == TabDetails && m.activeTab != TabDetails {
 			continue
 		}
-		if Tab(i) == m.activeTab {
+		if tab == m.activeTab {
 			tabs = append(tabs, tabActive.Render("● "+name))
 		} else {
 			tabs = append(tabs, tabInactive.Render("  "+name))
@@ -471,6 +475,232 @@ func (m Model) renderDetails() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, table)
 }
 
+// --- Analysis screen ---
+
+func (m Model) renderAnalysis() string {
+	if len(m.peakEvents) == 0 {
+		return rowDimStyle.Render("No data for analysis yet. Peaks will appear here when CPU exceeds threshold.")
+	}
+
+	offenders := m.renderTopOffenders()
+	hourly := m.renderHourlyActivity()
+	daily := m.renderDailyTrend()
+
+	leftCol := lipgloss.JoinVertical(lipgloss.Left, offenders, "", hourly)
+	sep := separatorStyle.Render("│")
+
+	return lipgloss.JoinHorizontal(lipgloss.Top,
+		leftCol,
+		" "+sep+" ",
+		daily,
+	)
+}
+
+// renderTopOffenders shows a ranked list of processes by peak count.
+func (m Model) renderTopOffenders() string {
+	// Count appearances per process name.
+	type offender struct {
+		Name   string
+		Count  int
+		MaxCPU float64
+	}
+	counts := make(map[string]*offender)
+	for _, ev := range m.peakEvents {
+		if len(ev.TopProcs) == 0 {
+			continue
+		}
+		name := ev.TopProcs[0].Name
+		o, ok := counts[name]
+		if !ok {
+			o = &offender{Name: name}
+			counts[name] = o
+		}
+		o.Count++
+		if ev.TotalCPU > o.MaxCPU {
+			o.MaxCPU = ev.TotalCPU
+		}
+	}
+
+	// Sort by count descending.
+	var list []offender
+	for _, o := range counts {
+		list = append(list, *o)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Count > list[j].Count
+	})
+
+	n := 8
+	if n > len(list) {
+		n = len(list)
+	}
+	list = list[:n]
+
+	maxCount := 0
+	for _, o := range list {
+		if o.Count > maxCount {
+			maxCount = o.Count
+		}
+	}
+
+	lines := []string{headerStyle.Render("Top Offenders"), ""}
+
+	barWidth := 20
+	for _, o := range list {
+		name := o.Name
+		if len(name) > 22 {
+			name = name[:19] + "..."
+		}
+
+		filled := 0
+		if maxCount > 0 {
+			filled = o.Count * barWidth / maxCount
+		}
+		if filled < 1 && o.Count > 0 {
+			filled = 1
+		}
+
+		bar := lipgloss.NewStyle().Foreground(colorAccent).Render(strings.Repeat("█", filled)) +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#2D3748")).Render(strings.Repeat("░", barWidth-filled))
+
+		cpuStr := cpuStyle(o.MaxCPU).Render(fmt.Sprintf("%.0f%%", o.MaxCPU))
+
+		lines = append(lines, fmt.Sprintf("  %-22s %3d  %s  %s", name, o.Count, bar, cpuStr))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderHourlyActivity shows a 24-hour heatmap of peak frequency.
+func (m Model) renderHourlyActivity() string {
+	var hours [24]int
+	for _, ev := range m.peakEvents {
+		h := ev.Timestamp.Hour()
+		hours[h]++
+	}
+
+	maxH := 0
+	for _, c := range hours {
+		if c > maxH {
+			maxH = c
+		}
+	}
+
+	blocks := []rune{'░', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+
+	lines := []string{headerStyle.Render("Hourly Activity"), ""}
+
+	// Hour labels.
+	var labelRow strings.Builder
+	labelRow.WriteString("  ")
+	for h := 0; h < 24; h++ {
+		labelRow.WriteString(fmt.Sprintf("%-3d", h))
+	}
+	lines = append(lines, labelStyle.Render(labelRow.String()))
+
+	// Bar row.
+	var barRow strings.Builder
+	barRow.WriteString("  ")
+	for h := 0; h < 24; h++ {
+		idx := 0
+		if maxH > 0 && hours[h] > 0 {
+			idx = hours[h] * (len(blocks) - 1) / maxH
+			if idx < 1 {
+				idx = 1
+			}
+		}
+		ch := string(blocks[idx])
+		c := colorForPct(float64(hours[h]) / float64(max(maxH, 1)) * 100)
+		barRow.WriteString(lipgloss.NewStyle().Foreground(c).Render(ch))
+		barRow.WriteString("  ")
+	}
+	lines = append(lines, barRow.String())
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderDailyTrend shows peaks per day for the last 7 days.
+func (m Model) renderDailyTrend() string {
+	now := time.Now()
+	days := 7
+	type dayEntry struct {
+		Date  time.Time
+		Count int
+	}
+	entries := make([]dayEntry, days)
+	for i := 0; i < days; i++ {
+		entries[days-1-i] = dayEntry{Date: now.AddDate(0, 0, -i)}
+	}
+
+	// Count events per day.
+	for _, ev := range m.peakEvents {
+		evDay := ev.Timestamp.Format("2006-01-02")
+		for i := range entries {
+			if entries[i].Date.Format("2006-01-02") == evDay {
+				entries[i].Count++
+			}
+		}
+	}
+
+	maxD := 0
+	for _, e := range entries {
+		if e.Count > maxD {
+			maxD = e.Count
+		}
+	}
+
+	blocks := []rune{'░', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	barWidth := 15
+
+	lines := []string{headerStyle.Render("Daily Trend (7 days)"), ""}
+
+	for _, e := range entries {
+		dayLabel := e.Date.Format("Jan 02")
+		weekday := e.Date.Format("Mon")
+
+		filled := 0
+		if maxD > 0 && e.Count > 0 {
+			filled = e.Count * barWidth / maxD
+			if filled < 1 {
+				filled = 1
+			}
+		}
+
+		idx := 0
+		if maxD > 0 && e.Count > 0 {
+			idx = e.Count * (len(blocks) - 1) / maxD
+			if idx < 1 {
+				idx = 1
+			}
+		}
+
+		c := colorForPct(float64(e.Count) / float64(max(maxD, 1)) * 100)
+		bar := lipgloss.NewStyle().Foreground(c).Render(strings.Repeat(string(blocks[idx]), filled)) +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#2D3748")).Render(strings.Repeat("░", barWidth-filled))
+
+		countStr := fmt.Sprintf("%d", e.Count)
+		if e.Count == 0 {
+			countStr = lipgloss.NewStyle().Foreground(colorFaint).Render("0")
+		}
+
+		lines = append(lines, fmt.Sprintf("  %s %-3s  %s  %s peaks",
+			labelStyle.Render(dayLabel),
+			labelStyle.Render(weekday),
+			bar,
+			countStr,
+		))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // --- Status & Help ---
 
 func (m Model) renderStatusBar() string {
@@ -484,11 +714,13 @@ func (m Model) renderHelp() string {
 	var parts []string
 	switch m.activeTab {
 	case TabLive:
-		parts = []string{"↑/k ↓/j nav", "[/] threshold", "r reset", "tab switch", "q quit"}
+		parts = []string{"↑/k ↓/j nav", "[/] threshold", "r reset", "o logs", "l last log", "tab switch", "q quit"}
 	case TabHistory:
-		parts = []string{"↑/k ↓/j nav", "enter details", "tab switch", "q quit"}
+		parts = []string{"↑/k ↓/j nav", "enter details", "o logs", "l last log", "tab switch", "q quit"}
+	case TabAnalysis:
+		parts = []string{"o logs", "l last log", "tab switch", "q quit"}
 	case TabDetails:
-		parts = []string{"↑/k ↓/j nav", "esc back", "tab switch", "q quit"}
+		parts = []string{"↑/k ↓/j nav", "esc back", "o logs", "l last log", "tab switch", "q quit"}
 	}
 
 	styled := make([]string, len(parts))
