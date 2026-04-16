@@ -28,6 +28,7 @@ type Model struct {
 	// Data
 	snapshot     model.CPUSnapshot
 	peakEvents   []model.PeakEvent
+	bursts       []model.PeakBurst
 	summary      model.HistorySummary
 	lastPeakTime time.Time
 	peakCount    int
@@ -94,6 +95,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case PeakMsg:
 		m.peakEvents = append(m.peakEvents, msg.Event)
+		m.rebuildBursts()
 		m.lastPeakTime = msg.Event.Timestamp
 		m.peakCount++
 		m.setStatus("Peak detected: %.1f%% CPU", msg.Event.TotalCPU)
@@ -101,6 +103,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case HistoryLoadedMsg:
 		m.peakEvents = msg.Events
+		m.rebuildBursts()
 		m.summary = msg.Summary
 		if len(msg.Events) > 0 {
 			m.setStatus("Loaded %d historical events", len(msg.Events))
@@ -127,6 +130,10 @@ func (m *Model) updatePeaks(procs []model.ProcessInfo) {
 			m.procPeaks[p.PID] = p.CPUPercent
 		}
 	}
+}
+
+func (m *Model) rebuildBursts() {
+	m.bursts = model.GroupBursts(m.peakEvents)
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -162,10 +169,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, keys.Enter):
-		if m.activeTab == TabHistory && len(m.peakEvents) > 0 {
-			m.detailIdx = m.cursor
-			m.activeTab = TabDetails
-			m.cursor = 0
+		if m.activeTab == TabHistory && len(m.bursts) > 0 {
+			bursts := reverseBursts(m.bursts)
+			if m.cursor < len(bursts) {
+				m.detailIdx = m.cursor
+				m.activeTab = TabDetails
+				m.cursor = 0
+			}
 			return m, nil
 		}
 		return m, nil
@@ -224,10 +234,11 @@ func (m *Model) clampCursor() {
 	case TabLive:
 		max = len(m.snapshot.Processes) - 1
 	case TabHistory:
-		max = len(m.peakEvents) - 1
+		max = len(m.bursts) - 1
 	case TabDetails:
-		if m.detailIdx < len(m.peakEvents) {
-			max = len(m.peakEvents[m.detailIdx].TopProcs) - 1
+		bursts := reverseBursts(m.bursts)
+		if m.detailIdx < len(bursts) {
+			max = len(bursts[m.detailIdx].Events) - 1
 		}
 	}
 	if max < 0 {
@@ -268,6 +279,15 @@ func listenPeak(ch <-chan model.PeakEvent) tea.Cmd {
 		}
 		return PeakMsg{Event: ev}
 	}
+}
+
+func reverseBursts(bursts []model.PeakBurst) []model.PeakBurst {
+	n := len(bursts)
+	rev := make([]model.PeakBurst, n)
+	for i, b := range bursts {
+		rev[n-1-i] = b
+	}
+	return rev
 }
 
 func tickCmd() tea.Cmd {

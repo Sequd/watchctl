@@ -123,24 +123,6 @@ func (m Model) renderCPUPanel() string {
 		))
 	}
 
-	// Summary info.
-	if m.summary.TotalEvents > 0 {
-		lines = append(lines, "")
-		lines = append(lines, labelStyle.Render("History"))
-		lines = append(lines, fmt.Sprintf("  %s %d events",
-			labelStyle.Render("Total:"),
-			m.summary.TotalEvents,
-		))
-		if len(m.summary.FrequentProcs) > 0 {
-			top := m.summary.FrequentProcs[0]
-			lines = append(lines, fmt.Sprintf("  %s %s (%dx)",
-				labelStyle.Render("Top:"),
-				top.Name,
-				top.Count,
-			))
-		}
-	}
-
 	width := 32
 	return lipgloss.NewStyle().Width(width).Render(
 		lipgloss.JoinVertical(lipgloss.Left, lines...),
@@ -338,33 +320,36 @@ func (m Model) renderProcessTable(procs []model.ProcessInfo, interactive bool) s
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-// --- History screen ---
+// --- History screen (burst-aggregated) ---
 
 func (m Model) renderHistory() string {
-	if len(m.peakEvents) == 0 {
+	if len(m.bursts) == 0 {
 		return rowDimStyle.Render("No peak events recorded yet.")
 	}
 
 	hdr := headerStyle.Render(
-		fmt.Sprintf("%-20s %8s  %-25s", "Time", "CPU%", "Top Process"),
+		fmt.Sprintf("%-25s %7s %5s  %-22s", "Time", "Peak%", "Hits", "Process"),
 	)
 
 	var rows []string
 	rows = append(rows, hdr)
 
-	events := reverseEvents(m.peakEvents)
-	for i, ev := range events {
-		topName := ""
-		if len(ev.TopProcs) > 0 {
-			topName = ev.TopProcs[0].Name
-			if len(topName) > 25 {
-				topName = topName[:22] + "..."
-			}
+	bursts := reverseBursts(m.bursts)
+	for i, b := range bursts {
+		name := b.TopProcess
+		if len(name) > 22 {
+			name = name[:19] + "..."
 		}
 
-		ts := ev.Timestamp.Format("2006-01-02 15:04:05")
-		cpuStr := cpuStyle(ev.TotalCPU).Render(fmt.Sprintf("%7.1f%%", ev.TotalCPU))
-		line := fmt.Sprintf("%-20s %s  %-25s", ts, cpuStr, topName)
+		ts := b.LastTime.Format("01-02 15:04:05")
+
+		cpuStr := cpuStyle(b.MaxCPU).Render(fmt.Sprintf("%6.1f%%", b.MaxCPU))
+		countStr := fmt.Sprintf("%3dx", b.Count)
+		if b.Count == 1 {
+			countStr = "   1"
+		}
+
+		line := fmt.Sprintf("%-25s %s %s  %-22s", ts, cpuStr, countStr, name)
 
 		if i == m.cursor {
 			rows = append(rows, rowSelectedStyle.Render(line))
@@ -373,15 +358,7 @@ func (m Model) renderHistory() string {
 		}
 	}
 
-	summaryLines := m.renderSummaryPanel()
-	sep := separatorStyle.Render("│")
-
-	leftCol := lipgloss.JoinVertical(lipgloss.Left, rows...)
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		leftCol,
-		" "+sep+" ",
-		summaryLines,
-	)
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
 func (m Model) renderSummaryPanel() string {
@@ -421,41 +398,76 @@ func (m Model) renderSummaryPanel() string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-// --- Details screen ---
+// --- Details screen (burst events) ---
 
 func (m Model) renderDetails() string {
-	events := reverseEvents(m.peakEvents)
-	if m.detailIdx >= len(events) {
+	bursts := reverseBursts(m.bursts)
+	if m.detailIdx >= len(bursts) {
 		return rowDimStyle.Render("No event selected.")
 	}
-	ev := events[m.detailIdx]
+	b := bursts[m.detailIdx]
+
+	// Burst header.
+	var timeRange string
+	if b.Count == 1 {
+		timeRange = b.FirstTime.Format("2006-01-02 15:04:05")
+	} else {
+		timeRange = b.FirstTime.Format("2006-01-02 15:04:05") + " — " + b.LastTime.Format("15:04:05")
+	}
 
 	hdr := []string{
-		headerStyle.Render("Peak Event Details"),
+		headerStyle.Render("Burst Details"),
 		"",
+		fmt.Sprintf("  %s %s",
+			labelStyle.Render("Process:"),
+			lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(b.TopProcess),
+		),
 		fmt.Sprintf("  %s %s",
 			labelStyle.Render("Time:"),
-			ev.Timestamp.Format("2006-01-02 15:04:05"),
+			timeRange,
 		),
 		fmt.Sprintf("  %s %s",
-			labelStyle.Render("CPU:"),
-			cpuStyle(ev.TotalCPU).Render(fmt.Sprintf("%.1f%%", ev.TotalCPU)),
+			labelStyle.Render("Peak CPU:"),
+			cpuStyle(b.MaxCPU).Render(fmt.Sprintf("%.1f%%", b.MaxCPU)),
 		),
-		fmt.Sprintf("  %s %.0f%%",
-			labelStyle.Render("Threshold:"),
-			ev.Threshold,
-		),
-		fmt.Sprintf("  %s %s",
-			labelStyle.Render("ID:"),
-			lipgloss.NewStyle().Foreground(colorFaint).Render(ev.ID),
+		fmt.Sprintf("  %s %d",
+			labelStyle.Render("Events:"),
+			b.Count,
 		),
 		"",
-		headerStyle.Render("Processes"),
+		headerStyle.Render("Events in burst"),
 	}
 
 	header := lipgloss.JoinVertical(lipgloss.Left, hdr...)
-	table := m.renderProcessTable(ev.TopProcs, true)
 
+	// Events table.
+	evHdr := headerStyle.Render(
+		fmt.Sprintf("  %-20s %8s  %-25s", "Time", "CPU%", "Top Process"),
+	)
+	var rows []string
+	rows = append(rows, evHdr)
+
+	for i, ev := range b.Events {
+		topName := ""
+		if len(ev.TopProcs) > 0 {
+			topName = ev.TopProcs[0].Name
+			if len(topName) > 25 {
+				topName = topName[:22] + "..."
+			}
+		}
+
+		ts := ev.Timestamp.Format("15:04:05")
+		cpuStr := cpuStyle(ev.TotalCPU).Render(fmt.Sprintf("%7.1f%%", ev.TotalCPU))
+		line := fmt.Sprintf("  %-20s %s  %-25s", ts, cpuStr, topName)
+
+		if i == m.cursor {
+			rows = append(rows, rowSelectedStyle.Render(line))
+		} else {
+			rows = append(rows, rowNormalStyle.Render(line))
+		}
+	}
+
+	table := lipgloss.JoinVertical(lipgloss.Left, rows...)
 	return lipgloss.JoinVertical(lipgloss.Left, header, table)
 }
 
