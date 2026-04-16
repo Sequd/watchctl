@@ -41,6 +41,68 @@ type ProcFrequency struct {
 	Count int
 }
 
+// PeakBurst groups consecutive peaks triggered by the same top process.
+type PeakBurst struct {
+	TopProcess string
+	FirstTime  time.Time
+	LastTime   time.Time
+	MaxCPU     float64
+	Count      int
+	Events     []PeakEvent
+}
+
+// BurstGap is the maximum time between peaks to merge them into one burst.
+const BurstGap = 5 * time.Minute
+
+// GroupBursts merges consecutive PeakEvents with the same top process
+// into bursts when they are within BurstGap of each other.
+func GroupBursts(events []PeakEvent) []PeakBurst {
+	if len(events) == 0 {
+		return nil
+	}
+
+	var bursts []PeakBurst
+	current := newBurst(events[0])
+
+	for i := 1; i < len(events); i++ {
+		ev := events[i]
+		topName := topProcName(ev)
+		gap := ev.Timestamp.Sub(current.LastTime)
+
+		if topName == current.TopProcess && gap <= BurstGap {
+			current.LastTime = ev.Timestamp
+			current.Count++
+			current.Events = append(current.Events, ev)
+			if ev.TotalCPU > current.MaxCPU {
+				current.MaxCPU = ev.TotalCPU
+			}
+		} else {
+			bursts = append(bursts, current)
+			current = newBurst(ev)
+		}
+	}
+	bursts = append(bursts, current)
+	return bursts
+}
+
+func newBurst(ev PeakEvent) PeakBurst {
+	return PeakBurst{
+		TopProcess: topProcName(ev),
+		FirstTime:  ev.Timestamp,
+		LastTime:   ev.Timestamp,
+		MaxCPU:     ev.TotalCPU,
+		Count:      1,
+		Events:     []PeakEvent{ev},
+	}
+}
+
+func topProcName(ev PeakEvent) string {
+	if len(ev.TopProcs) > 0 {
+		return ev.TopProcs[0].Name
+	}
+	return ""
+}
+
 // Config holds runtime configuration.
 type Config struct {
 	PollInterval time.Duration

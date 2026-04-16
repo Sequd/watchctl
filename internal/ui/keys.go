@@ -11,6 +11,8 @@ type keyMap struct {
 	Reset     key.Binding
 	ThreshUp  key.Binding
 	ThreshDn  key.Binding
+	OpenDir   key.Binding
+	OpenLog   key.Binding
 	Quit      key.Binding
 }
 
@@ -46,6 +48,14 @@ var keys = keyMap{
 	ThreshDn: key.NewBinding(
 		key.WithKeys("["),
 		key.WithHelp("[", "threshold -5%"),
+	),
+	OpenDir: key.NewBinding(
+		key.WithKeys("o"),
+		key.WithHelp("o", "open log dir"),
+	),
+	OpenLog: key.NewBinding(
+		key.WithKeys("l"),
+		key.WithHelp("l", "open last log"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ekorunov/watchctl/internal/model"
@@ -14,10 +15,16 @@ import (
 
 const dirName = "watchctl"
 
-// Logger writes peak events to JSON files and handles rotation.
+// DailyLog is the JSON structure written to disk — one file per day.
+type DailyLog struct {
+	Date   string            `json:"date"`
+	Events []model.PeakEvent `json:"events"`
+}
+
+// Logger writes peak events to daily JSON files.
 type Logger struct {
-	dir         string
-	maxFiles    int
+	dir      string
+	maxFiles int
 }
 
 // New creates a Logger that writes to os.TempDir()/watchctl.
@@ -34,7 +41,7 @@ func (l *Logger) Dir() string {
 	return l.dir
 }
 
-// Run consumes peak events and writes each to a JSON file.
+// Run consumes peak events and appends them to daily log files.
 func (l *Logger) Run(ctx context.Context, events <-chan model.PeakEvent) {
 	for {
 		select {
@@ -44,24 +51,43 @@ func (l *Logger) Run(ctx context.Context, events <-chan model.PeakEvent) {
 			if !ok {
 				return
 			}
-			_ = l.write(ev)
-			l.rotate()
+			_ = l.appendEvent(ev)
 		}
 	}
 }
 
-func (l *Logger) write(ev model.PeakEvent) error {
-	name := fmt.Sprintf("peak_%s_%s.json",
-		ev.Timestamp.Format("20060102_150405"),
-		ev.ID[:8],
-	)
-	path := filepath.Join(l.dir, name)
+func (l *Logger) dailyPath(t time.Time) string {
+	return filepath.Join(l.dir, t.Format("2006-01-02")+".json")
+}
 
-	data, err := json.MarshalIndent(ev, "", "  ")
+func (l *Logger) appendEvent(ev model.PeakEvent) error {
+	path := l.dailyPath(ev.Timestamp)
+
+	daily := l.loadDaily(path)
+	daily.Events = append(daily.Events, ev)
+
+	data, err := json.MarshalIndent(daily, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return err
+	}
+
+	l.rotate()
+	return nil
+}
+
+func (l *Logger) loadDaily(path string) DailyLog {
+	date := strings.TrimSuffix(filepath.Base(path), ".json")
+	daily := DailyLog{Date: date}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return daily
+	}
+	_ = json.Unmarshal(data, &daily)
+	return daily
 }
 
 func (l *Logger) rotate() {
@@ -91,7 +117,7 @@ func (l *Logger) rotate() {
 	}
 }
 
-// LoadEvents reads all saved peak events from disk, sorted by time.
+// LoadEvents reads all saved events from disk, sorted by time.
 func (l *Logger) LoadEvents() ([]model.PeakEvent, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
@@ -110,8 +136,17 @@ func (l *Logger) LoadEvents() ([]model.PeakEvent, error) {
 		if err != nil {
 			continue
 		}
+
+		// Try daily format.
+		var daily DailyLog
+		if json.Unmarshal(data, &daily) == nil && len(daily.Events) > 0 {
+			events = append(events, daily.Events...)
+			continue
+		}
+
+		// Fallback: old single-event format.
 		var ev model.PeakEvent
-		if json.Unmarshal(data, &ev) == nil {
+		if json.Unmarshal(data, &ev) == nil && !ev.Timestamp.IsZero() {
 			events = append(events, ev)
 		}
 	}
