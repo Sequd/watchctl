@@ -25,7 +25,7 @@ const (
 	TabDetails
 )
 
-const cpuHistoryLen = 60
+const cpuHistoryLen = 120
 
 var tabNames = []string{"Live", "History", "Analysis", "Details"}
 

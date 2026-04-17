@@ -22,6 +22,8 @@ var (
 func (m Model) renderView() string {
 	header := m.renderHeader()
 	tabs := m.renderTabs()
+	statusBar := m.renderStatusBar()
+	helpBar := m.renderHelp()
 
 	var body string
 	switch m.activeTab {
@@ -35,8 +37,22 @@ func (m Model) renderView() string {
 		body = m.renderDetails()
 	}
 
-	statusBar := m.renderStatusBar()
-	helpBar := m.renderHelp()
+	// Fixed lines: header(1) + tabs(1) + blank(1) + blank(1) + helpBar(1) = 5
+	// Plus optional statusBar: blank(1) + statusBar(1) = 2
+	fixedLines := 5
+	if statusBar != "" {
+		fixedLines += 2
+	}
+	bodyHeight := m.height - fixedLines
+	if bodyHeight < 1 {
+		bodyHeight = 1
+	}
+
+	// Pad body with blank lines so helpBar is always pinned to the bottom.
+	bodyLines := strings.Count(body, "\n") + 1
+	if bodyLines < bodyHeight {
+		body += strings.Repeat("\n", bodyHeight-bodyLines)
+	}
 
 	parts := []string{header, tabs, "", body}
 	if statusBar != "" {
@@ -73,51 +89,85 @@ func (m Model) renderTabs() string {
 // --- Live screen ---
 
 func (m Model) renderLive() string {
-	leftCol := m.renderCPUPanel()
-	rightCol := m.renderProcessTable(m.snapshot.Processes, true)
+	chart := m.renderCPUChartFull()
+
+	stats := m.renderCPUSummary()
+	procs := m.renderProcessTable(m.snapshot.Processes, true)
 
 	sep := separatorStyle.Render("│")
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		leftCol,
+	bottom := lipgloss.JoinHorizontal(lipgloss.Top,
+		stats,
 		" "+sep+" ",
-		rightCol,
+		procs,
 	)
+
+	return lipgloss.JoinVertical(lipgloss.Left, chart, "", bottom)
 }
 
-func (m Model) renderCPUPanel() string {
+func (m Model) renderCPUChartFull() string {
 	pct := m.snapshot.TotalUsage
-	style := cpuStyle(pct)
 
-	label := labelStyle.Render("CPU Total")
-	value := style.Render(fmt.Sprintf("%.1f%%", pct))
-	bar := renderBar(pct, 22)
-
-	lines := []string{
-		label,
-		value + "  " + bar,
+	// Chart occupies half the terminal width; border(2) + padding(2) = 4 overhead.
+	chartWidth := m.width/2 - 4
+	if chartWidth < 10 {
+		chartWidth = 10
 	}
 
-	// Braille chart.
-	if len(m.cpuHistory) > 1 {
-		lines = append(lines, "")
-		chart := renderBrailleChart(m.cpuHistory, 14, m.threshold)
-		stats := chartStats(m.cpuHistory)
-		lines = append(lines, chart)
-		lines = append(lines, labelStyle.Render(stats))
+	barWidth := m.width/2 - 33
+	if barWidth < 6 {
+		barWidth = 6
 	}
 
-	// Threshold.
-	lines = append(lines, "")
-	threshLabel := fmt.Sprintf("  %s %.0f%%",
-		labelStyle.Render("Threshold:"),
-		m.threshold,
+	// Header line — no border, just above the chart.
+	header := lipgloss.JoinHorizontal(lipgloss.Bottom,
+		labelStyle.Render("CPU "),
+		cpuStyle(pct).Render(fmt.Sprintf("%.1f%%", pct)),
+		"  ",
+		renderBar(pct, barWidth),
+		labelStyle.Render(fmt.Sprintf("  %.0f%% threshold", m.threshold)),
+		helpStyle.Render("  [/]"),
 	)
-	lines = append(lines, threshLabel)
-	lines = append(lines, helpStyle.Render("  [/] adjust"))
 
-	// Peak indicator.
+	lines := []string{header}
+
+	if len(m.cpuHistory) > 1 {
+		chartContent := renderBrailleChart(m.cpuHistory, chartWidth, 4)
+		lines = append(lines, manualBorder(chartContent, colorBorder))
+		lines = append(lines, labelStyle.Render(chartStats(m.cpuHistory)))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// manualBorder draws a rounded border around pre-rendered ANSI content line by line,
+// bypassing lipgloss reflow which mis-measures ANSI sequences and causes wrapping artifacts.
+func manualBorder(content string, color lipgloss.Color) string {
+	bc := lipgloss.NewStyle().Foreground(color)
+	rows := strings.Split(content, "\n")
+
+	// Measure visual width from the first non-empty row.
+	innerWidth := 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r); w > innerWidth {
+			innerWidth = w
+		}
+	}
+	dash := strings.Repeat("─", innerWidth+2)
+
+	out := make([]string, 0, len(rows)+2)
+	out = append(out, bc.Render("╭"+dash+"╮"))
+	for _, r := range rows {
+		out = append(out, bc.Render("│")+" "+r+" "+bc.Render("│"))
+	}
+	out = append(out, bc.Render("╰"+dash+"╯"))
+	return strings.Join(out, "\n")
+}
+
+func (m Model) renderCPUSummary() string {
+	var lines []string
+
 	if time.Since(m.lastPeakTime) < 5*time.Second {
-		lines = append(lines, "", badgeErr.Render(" PEAK "))
+		lines = append(lines, " "+badgeErr.Render(" PEAK "))
 	}
 
 	if m.peakCount > 0 {
@@ -125,10 +175,11 @@ func (m Model) renderCPUPanel() string {
 			labelStyle.Render("Peaks:"),
 			m.peakCount,
 		))
+	} else {
+		lines = append(lines, rowDimStyle.Render("No peaks yet"))
 	}
 
-	width := 32
-	return lipgloss.NewStyle().Width(width).Render(
+	return lipgloss.NewStyle().Width(28).Render(
 		lipgloss.JoinVertical(lipgloss.Left, lines...),
 	)
 }
@@ -162,25 +213,21 @@ func barColorForPct(pct float64) lipgloss.Color {
 	}
 }
 
-// renderBrailleChart draws a 2-row braille area chart.
-// Each character holds 2 data points horizontally and 4 levels vertically per row (8 total).
-func renderBrailleChart(data []float64, widthChars int, threshold float64) string {
+// renderBrailleChart draws a numRows-row braille area chart.
+// Each character holds 2 data points horizontally and 4 levels vertically (numRows*4 total levels).
+func renderBrailleChart(data []float64, widthChars int, numRows int) string {
 	maxPoints := widthChars * 2
-	// Take last maxPoints samples.
 	if len(data) > maxPoints {
 		data = data[len(data)-maxPoints:]
 	}
-
-	// Pad left with zeros if not enough data.
 	if len(data) < maxPoints {
 		padded := make([]float64, maxPoints)
 		copy(padded[maxPoints-len(data):], data)
 		data = padded
 	}
 
-	maxVal := 100.0 // always scale to 100%
-
-	var topRow, bottomRow strings.Builder
+	totalLevels := numRows * 4
+	rows := make([]strings.Builder, numRows)
 
 	for i := 0; i < len(data); i += 2 {
 		lv := data[i]
@@ -189,73 +236,62 @@ func renderBrailleChart(data []float64, widthChars int, threshold float64) strin
 			rv = data[i+1]
 		}
 
-		// Map to 0-8 levels.
-		ll := int(math.Round(lv / maxVal * 8))
-		rl := int(math.Round(rv / maxVal * 8))
-		if ll > 8 {
-			ll = 8
-		}
-		if rl > 8 {
-			rl = 8
+		ll := int(math.Round(lv / 100.0 * float64(totalLevels)))
+		rl := int(math.Round(rv / 100.0 * float64(totalLevels)))
+		if ll > totalLevels {
+			ll = totalLevels
 		}
 		if ll < 0 {
 			ll = 0
+		}
+		if rl > totalLevels {
+			rl = totalLevels
 		}
 		if rl < 0 {
 			rl = 0
 		}
 
-		// Top row: levels 5-8, Bottom row: levels 1-4.
-		topChar := brailleBase
-		bottomChar := brailleBase
-
-		// Left column.
-		topLeft := ll - 4
-		if topLeft < 0 {
-			topLeft = 0
-		}
-		bottomLeft := ll
-		if bottomLeft > 4 {
-			bottomLeft = 4
-		}
-		for j := 0; j < topLeft; j++ {
-			topChar |= leftDots[j]
-		}
-		for j := 0; j < bottomLeft; j++ {
-			bottomChar |= leftDots[j]
-		}
-
-		// Right column.
-		topRight := rl - 4
-		if topRight < 0 {
-			topRight = 0
-		}
-		bottomRight := rl
-		if bottomRight > 4 {
-			bottomRight = 4
-		}
-		for j := 0; j < topRight; j++ {
-			topChar |= rightDots[j]
-		}
-		for j := 0; j < bottomRight; j++ {
-			bottomChar |= rightDots[j]
-		}
-
-		// Color by max of two values.
 		mv := lv
 		if rv > mv {
 			mv = rv
 		}
+		st := lipgloss.NewStyle().Foreground(colorForPct(mv))
 
-		ts := string(topChar)
-		bs := string(bottomChar)
+		for row := 0; row < numRows; row++ {
+			// row 0 = top (highest levels), row numRows-1 = bottom (lowest levels).
+			base := (numRows - 1 - row) * 4
 
-		c := colorForPct(mv)
-		topRow.WriteString(lipgloss.NewStyle().Foreground(c).Render(ts))
-		bottomRow.WriteString(lipgloss.NewStyle().Foreground(c).Render(bs))
+			leftFill := ll - base
+			if leftFill < 0 {
+				leftFill = 0
+			}
+			if leftFill > 4 {
+				leftFill = 4
+			}
+			rightFill := rl - base
+			if rightFill < 0 {
+				rightFill = 0
+			}
+			if rightFill > 4 {
+				rightFill = 4
+			}
+
+			ch := brailleBase
+			for j := 0; j < leftFill; j++ {
+				ch |= leftDots[j]
+			}
+			for j := 0; j < rightFill; j++ {
+				ch |= rightDots[j]
+			}
+			rows[row].WriteString(st.Render(string(ch)))
+		}
 	}
 
-	return topRow.String() + "\n" + bottomRow.String()
+	lines := make([]string, numRows)
+	for i, r := range rows {
+		lines[i] = r.String()
+	}
+	return strings.Join(lines, "\n")
 }
 
 func colorForPct(pct float64) lipgloss.Color {
