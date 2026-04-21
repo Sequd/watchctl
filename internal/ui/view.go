@@ -371,11 +371,23 @@ func (m Model) renderHistory() string {
 		fmt.Sprintf("%-25s %7s %5s  %-22s", "Time", "Peak%", "Hits", "Process"),
 	)
 
+	bursts := reverseBursts(m.bursts)
+
+	visible := m.height - 8
+	if visible < 1 {
+		visible = 1
+	}
+	offset := m.historyOffset
+	end := offset + visible
+	if end > len(bursts) {
+		end = len(bursts)
+	}
+
 	var rows []string
 	rows = append(rows, hdr)
 
-	bursts := reverseBursts(m.bursts)
-	for i, b := range bursts {
+	for i, b := range bursts[offset:end] {
+		actualIdx := offset + i
 		name := b.TopProcess
 		if len(name) > 22 {
 			name = name[:19] + "..."
@@ -391,11 +403,16 @@ func (m Model) renderHistory() string {
 
 		line := fmt.Sprintf("%-25s %s %s  %-22s", ts, cpuStr, countStr, name)
 
-		if i == m.cursor {
+		if actualIdx == m.cursor {
 			rows = append(rows, rowSelectedStyle.Render(line))
 		} else {
 			rows = append(rows, rowNormalStyle.Render(line))
 		}
+	}
+
+	if len(bursts) > visible {
+		scrollInfo := fmt.Sprintf("  %d–%d / %d", offset+1, end, len(bursts))
+		rows = append(rows, rowDimStyle.Render(scrollInfo))
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)

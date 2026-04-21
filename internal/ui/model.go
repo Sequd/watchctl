@@ -49,13 +49,14 @@ type Model struct {
 	logDir string
 
 	// UI state
-	activeTab    Tab
-	cursor       int
-	detailIdx    int
-	width        int
-	height       int
-	statusMsg    string
-	statusExpiry time.Time
+	activeTab     Tab
+	cursor        int
+	detailIdx     int
+	historyOffset int
+	width         int
+	height        int
+	statusMsg     string
+	statusExpiry  time.Time
 
 	// Channels (read in Cmds)
 	snapCh <-chan model.CPUSnapshot
@@ -167,17 +168,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.activeTab = TabLive
 		}
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 
 	case key.Matches(msg, keys.Up):
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		if m.activeTab == TabHistory {
+			m.ensureHistoryVisible()
+		}
 		return m, nil
 
 	case key.Matches(msg, keys.Down):
 		m.cursor++
 		m.clampCursor()
+		if m.activeTab == TabHistory {
+			m.ensureHistoryVisible()
+		}
 		return m, nil
 
 	case key.Matches(msg, keys.Enter):
@@ -288,6 +296,33 @@ func lastLogFile(dir string) string {
 	}
 	sort.Strings(jsons)
 	return filepath.Join(dir, jsons[len(jsons)-1])
+}
+
+func (m *Model) historyVisibleRows() int {
+	rows := m.height - 8 // fixed chrome (header+tabs+2blanks+help = 5, status worst-case = 2, list header = 1)
+	if rows < 1 {
+		rows = 1
+	}
+	return rows
+}
+
+func (m *Model) ensureHistoryVisible() {
+	visible := m.historyVisibleRows()
+	if m.cursor < m.historyOffset {
+		m.historyOffset = m.cursor
+	} else if m.cursor >= m.historyOffset+visible {
+		m.historyOffset = m.cursor - visible + 1
+	}
+	max := len(m.bursts) - visible
+	if max < 0 {
+		max = 0
+	}
+	if m.historyOffset > max {
+		m.historyOffset = max
+	}
+	if m.historyOffset < 0 {
+		m.historyOffset = 0
+	}
 }
 
 func (m *Model) clampCursor() {
